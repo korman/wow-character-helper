@@ -86,10 +86,10 @@ sealed class Patch {
   using(var b=new Bitmap(Path.Combine(dir,Name+".png"))) {var m=new Mask(b,Name.StartsWith("blocked")||Name.StartsWith("loading"));var ps=new List<Point>();for(int y=0;y<H;y++)for(int x=0;x<W;x++)if(m.V[y*W+x]!=0)ps.Add(new Point(x,y));On=ps.ToArray();}
   if(On.Length<15)throw new Exception("识别样本为空："+Name);
  }
- public Point? Find(Mask m,double threshold=0.78,int shiftX=0) {
+  public Point? Find(Mask m,double threshold=0.78,int shiftX=0,int radius=24) {
   if((Name.StartsWith("blocked")||Name.StartsWith("loading"))&&m.Gold!=null)m=m.Gold;
   double best=threshold;Point? at=null;
-  for(int y=Math.Max(0,Y-24);y<=Math.Min(m.H-H,Y+24);y++)for(int x=Math.Max(0,X+shiftX-24);x<=Math.Min(m.W-W,X+shiftX+24);x++) {
+   for(int y=Math.Max(0,Y-radius);y<=Math.Min(m.H-H,Y+radius);y++)for(int x=Math.Max(0,X+shiftX-radius);x<=Math.Min(m.W-W,X+shiftX+radius);x++) {
    int count=m.Count(x,y,W,H);if(count<On.Length*.65||count>On.Length*1.5)continue;
    int hit=0;foreach(var p in On) hit+=m.V[(y+p.Y)*m.W+x+p.X];
    double score=2.0*hit/(count+On.Length);if(score>best){best=score;at=new Point(x,y);}
@@ -101,11 +101,32 @@ sealed class Vision {
  public Dictionary<string,Patch> P=new Dictionary<string,Patch>();
  public Vision(string dir){foreach(string line in File.ReadAllLines(Path.Combine(dir,"index.txt"))){var p=new Patch(line,dir);P.Add(p.Name,p);}}
  public IEnumerable<Patch> Candidates(string n){yield return P[n];for(int i=2;P.ContainsKey(n+i);i++)yield return P[n+i];}
- public bool Has(Mask m,string n){return Candidates(n).Any(p=>p.Find(m).HasValue);}
+  public bool Has(Mask m,string n){return Has(m,n,24);}
+  public bool Has(Mask m,string n,int radius){return Candidates(n).Any(p=>p.Find(m,0.78,0,radius).HasValue);}
+ public Point? AppearanceButton(Bitmap frame,Mask mask){
+  return EnabledFooterButton(frame,mask,"appearance");
+ }
+ public Point? EnabledFooterButton(Bitmap frame,Mask mask,string name){
+  foreach(var sample in Candidates(name).Reverse()){
+   var at=sample.Find(mask);
+   if(!at.HasValue)continue;
+   Point center=new Point(at.Value.X+sample.W/2,at.Value.Y+sample.H/2);
+   if(new[]{-95,95}.All(dx=>{Color c=frame.GetPixel(center.X+dx,center.Y);return c.R>=65&&c.R>2*c.G&&c.R>2*c.B;}))return center;
+  }
+  return null;
+ }
+ public Point? EnabledSelect(Bitmap frame,Mask mask){
+  foreach(var sample in Candidates("select")){
+   var at=sample.Find(mask);if(!at.HasValue)continue;
+   var center=new Point(at.Value.X+sample.W/2,at.Value.Y+sample.H/2);
+   if(new[]{-60,60}.All(dx=>{Color c=frame.GetPixel(center.X+dx,center.Y);return c.R>=75&&c.R>2*c.G&&c.R>2*c.B;}))return center;
+  }
+  return null;
+ }
  public string State(Mask m){
   if(Has(m,"loading"))return "loading";
   if(Has(m,"blocked")||Has(m,"blockedOld"))return "blocked";
-  if(Has(m,"rules")&&Has(m,"pvp"))return "rules";
+   if(Has(m,"rules",90)||Has(m,"pvp",90))return "rules";
   if(Has(m,"raceHeader")&&Has(m,"appearance"))return "race";
   if(Has(m,"custom")&&Has(m,"skin"))return "custom";
   if(Has(m,"ruleButton")&&Has(m,"create")&&m.Count(900,675,760,80)<40)return "list";
@@ -126,14 +147,22 @@ sealed class Runner {
  public Runner(Vision v,Action<string> log,CancellationToken ct,CreationConfig c){this.v=v;this.log=log;this.ct=ct;config=c.Copy();interval=c.IntervalSeconds;max=c.MaxAttempts;restart=c.Restart;if(!c.Builtin&&CalibrationStore.Ready(c))profile=new Vision(CalibrationStore.Dir(c));}
  void Check(){Native.EnsurePhysicalCoordinates();ct.ThrowIfCancellationRequested();if(endAt.HasValue&&DateTime.UtcNow>=endAt.Value)throw new Exception("已达到最长运行时长，已停止。");if((Native.GetAsyncKeyState(27)&0x8000)!=0||(Native.GetAsyncKeyState(120)&0x8000)!=0)throw new OperationCanceledException();if(target!=IntPtr.Zero&&Native.GetForegroundWindow()!=target){uint a,b;Native.GetWindowThreadProcessId(target,out a);var front=Native.GetForegroundWindow();Native.GetWindowThreadProcessId(front,out b);if(a!=0&&a==b)return;var title=new StringBuilder(512);Native.GetWindowText(front,title,512);throw new Exception("游戏或战网失去前台，已停止。当前窗口："+title);}}
  void Delay(int ms){var timer=Stopwatch.StartNew();while(timer.ElapsedMilliseconds<ms){Check();int left=ms-(int)timer.ElapsedMilliseconds;if(left>0)Thread.Sleep(Math.Min(100,left));}Check();}
- void Bind(){
-  target=UniqueWindow(GamePath);if(target==IntPtr.Zero)throw new Exception("未找到游戏主窗口。");Check();uint id;Native.GetWindowThreadProcessId(target,out id);
-  using(var p=Process.GetProcessById((int)id))if(!string.Equals(p.MainModule.FileName,GamePath,StringComparison.OrdinalIgnoreCase))throw new Exception("请先切到《魔兽世界：无限》，再按 F8。");
+ void Bind(IntPtr window=default(IntPtr)){
+  target=window!=IntPtr.Zero?window:UniqueWindow(GamePath);if(target==IntPtr.Zero)throw new Exception("未找到游戏主窗口。");Check();uint id;Native.GetWindowThreadProcessId(target,out id);
+  using(var p=Process.GetProcessById((int)id)){
+   var module=p.MainModule;
+   if(module==null||!string.Equals(module.FileName,GamePath,StringComparison.OrdinalIgnoreCase))throw new Exception("未能核对游戏窗口的程序路径，已停止。");
+  }
  }
- List<Process> FindProcesses(string path){
+ List<Process> FindProcesses(string path,bool waitingForLaunch=false){
   var found=new List<Process>();
   foreach(var p in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(path))){
-   try{if(string.Equals(p.MainModule.FileName,path,StringComparison.OrdinalIgnoreCase)){found.Add(p);continue;}}
+   try{
+    var module=p.MainModule;
+    if(module==null&&!waitingForLaunch)throw new InvalidDataException("目标进程的程序路径暂不可读，请等待窗口加载后重试。");
+    if(module!=null&&string.Equals(module.FileName,path,StringComparison.OrdinalIgnoreCase)){found.Add(p);continue;}
+   }
+   catch(InvalidDataException){p.Dispose();foreach(var match in found)match.Dispose();throw;}
    catch(System.ComponentModel.Win32Exception){p.Dispose();throw new Exception("无法核对游戏或战网进程，已停止。");}
    catch(InvalidOperationException){}
    p.Dispose();
@@ -141,50 +170,56 @@ sealed class Runner {
   return found;
  }
  bool GameExists(){var all=FindProcesses(GamePath);bool yes=all.Count>0;foreach(var p in all)p.Dispose();return yes;}
- IntPtr UniqueWindow(string path){
-  var all=FindProcesses(path);try{var ids=new HashSet<uint>(all.Select(p=>(uint)p.Id));var windows=new List<IntPtr>();string title=path==GamePath?"魔兽世界":"战网";
+ IntPtr UniqueWindow(string path,bool waitingForLaunch=false){
+  var all=FindProcesses(path,waitingForLaunch);try{var ids=new HashSet<uint>(all.Select(p=>(uint)p.Id));var windows=new List<IntPtr>();string title=path==GamePath?"魔兽世界":"战网";
    Native.EnumWindows((h,param)=>{uint id;Native.GetWindowThreadProcessId(h,out id);if(ids.Contains(id)&&Native.IsWindowVisible(h)){var text=new StringBuilder(512);Native.GetWindowText(h,text,512);if(text.ToString()==title)windows.Add(h);}return true;},IntPtr.Zero);
    if(windows.Count>1)throw new Exception("发现多个目标窗口，已停止。");return windows.Count==1?windows[0]:IntPtr.Zero;
   }finally{foreach(var p in all)p.Dispose();}
  }
  void ShowLauncher(){
   target=IntPtr.Zero;Check();var h=UniqueWindow(LauncherPath);
-  if(h==IntPtr.Zero)throw new Exception("请先打开并登录战网，选择《魔兽世界：无限》WoW3 账号。");
+   if(h==IntPtr.Zero)throw new Exception("请先打开并登录战网，手动选中无限服页面。");
   Native.FocusWindow(h);Thread.Sleep(500);target=h;Check();
  }
  Bitmap CaptureLauncher(){Check();Native.Rect r;if(!Native.GetWindowRect(target,out r)||r.R-r.L<700||r.B-r.T<500)throw new Exception("战网窗口尺寸异常。");origin=new Point(r.L,r.T);var b=new Bitmap(r.R-r.L,r.B-r.T,PixelFormat.Format32bppArgb);using(var g=Graphics.FromImage(b))g.CopyFromScreen(origin,Point.Empty,b.Size);Check();return b;}
  public void SnapshotLauncher(){ShowLauncher();using(var b=CaptureLauncher())b.Save(Path.Combine(AppPaths.Screenshots,"调试-战网页面.png"));}
- public void SelectInfiniteLauncher(){
-  ShowLauncher();Rectangle icon;using(var b=CaptureLauncher())icon=LauncherVision.Icon(b,Check);
-  if(icon.IsEmpty)throw new Exception("未找到战网顶部的无限版图标，请将无限版加入收藏并保持图标可见。");
-  ClickLauncher(new Point(origin.X+icon.Left+icon.Width/2,origin.Y+icon.Top+icon.Height/2));Delay(1500);
-  using(var b=CaptureLauncher())b.Save(Path.Combine(AppPaths.Screenshots,"调试-战网选择无限.png"));
- }
- void ClickLauncher(Point p){Check();if(Native.GetAncestor(Native.WindowFromPoint(p),2)!=target)throw new Exception("战网控件被遮挡，已停止。");Native.SetCursorPos(p.X,p.Y);Native.Send(Native.M(2),Native.M(4));}
  public void SnapshotGame(){target=UniqueWindow(GamePath);if(target==IntPtr.Zero)throw new Exception("未找到游戏窗口。");Native.FocusWindow(target);Thread.Sleep(500);Check();Native.Rect r;Native.GetClientRect(target,out r);File.WriteAllText(Path.Combine(AppPaths.Logs,"调试-尺寸.txt"),r.R+"x"+r.B);using(var b=CaptureLauncher())b.Save(Path.Combine(AppPaths.Screenshots,"调试-游戏原图.png"));}
- void CloseBlockedGame(){Flow.Begin("exit","关闭游戏，并等待进程退出。");
-  Wait("blocked",10);uint id;Native.GetWindowThreadProcessId(target,out id);
+ void CloseBlockedGame(){Flow.Begin("exit","返回退出菜单，并等待游戏退出。");
+  Check();uint id;Native.GetWindowThreadProcessId(target,out id);
   using(var p=Process.GetProcessById((int)id)){
    if(!string.Equals(p.MainModule.FileName,GamePath,StringComparison.OrdinalIgnoreCase))throw new Exception("退出前核对游戏失败。");
-   log("已确认阵营限制，正在正常退出游戏。");Check();
-   if(!Native.PostMessage(target,0x10,IntPtr.Zero,IntPtr.Zero))throw new Exception("发送退出请求失败，已停止。");
-   target=IntPtr.Zero;var end=DateTime.UtcNow.AddSeconds(30);
-   while(!p.HasExited&&DateTime.UtcNow<end)Delay(200);
-   if(!p.HasExited){
-    if(UniqueWindow(GamePath)!=IntPtr.Zero)throw new Exception("游戏主窗口仍存在，已停止，不会强制关闭。");
-    log("正常退出后主窗口已消失，清理该游戏的残留后台进程。");Check();p.Kill();
-    end=DateTime.UtcNow.AddSeconds(10);while(!p.HasExited&&DateTime.UtcNow<end)Delay(200);
-    if(!p.HasExited)throw new Exception("残留进程未退出，已停止，避免重复启动。");
+   for(int presses=0;presses<=20;presses++){
+    Point? exit;
+    using(var frame=Capture())exit=ExitMenu.FindExit(frame,v.P["agreementExit"]);
+    Check();
+    if(exit.HasValue){
+     var point=new Point(origin.X+(int)(exit.Value.X*scaleX),origin.Y+(int)(exit.Value.Y*scaleY));
+     if(Native.GetAncestor(Native.WindowFromPoint(point),2)!=target||!Native.SetCursorPos(point.X,point.Y))throw new Exception("退出游戏按钮被遮挡或无法定位。");
+     Delay(100);Native.Send(Native.M(2));
+     try{Thread.Sleep(100);}finally{Native.Send(Native.M(4));}
+     target=IntPtr.Zero;log("已点击“退出游戏”，等待游戏进程结束。");
+     var end=DateTime.UtcNow.AddSeconds(30);
+     while(!p.HasExited&&DateTime.UtcNow<end)Delay(200);
+     if(!p.HasExited)throw new Exception("点击退出后游戏仍在运行，已停止。");
+     log("阵营限制退出流程完成。");return;
+    }
+    if(presses==20)break;
+    Native.Send(Native.K(27,0,0));
+    try{Thread.Sleep(80);}finally{Native.Send(Native.K(27,0,2));}
+    log("已发送第 "+(presses+1)+" 次 Esc，等待“退出游戏”按钮。");
+    Delay(1000);
    }
+   SaveDiagnostic(session+"-未找到退出游戏");throw new Exception("按 Esc 20 次后仍未识别到“退出游戏”，已停止。");
   }
  }
  Point LaunchButton(){
-  Check();log("定位战网无限版图标，自动切换并核对 WoW3 (CN)。");SelectInfiniteLauncher();
+   ShowLauncher();log("查找当前战网页面的进入游戏按钮；不会切换游戏或账号。");
   using(var b=CaptureLauncher()){var play=LauncherVision.Play(b,Check);return new Point(origin.X+play.X+play.Width/2,origin.Y+play.Y+play.Height/2);}
  }
- public void CheckLauncherOnly(){LaunchButton();log("PASS: 已选择无限版并核对账号和启动按钮；未启动游戏。");}
+  public void CheckLauncherOnly(){LaunchButton();log("PASS: 找到当前战网页面的进入游戏按钮；未点击或启动游戏。");}
  public void LaunchOnly(){ShowLauncher();LaunchGame();log("PASS: 已进入无限版建角页面；未选择角色或提交建号。");}
- static bool SameProcess(IntPtr a,IntPtr b){if(a==IntPtr.Zero||b==IntPtr.Zero)return false;uint x,y;Native.GetWindowThreadProcessId(a,out x);Native.GetWindowThreadProcessId(b,out y);return x!=0&&x==y;}
+  static bool SameProcess(IntPtr a,IntPtr b){if(a==IntPtr.Zero||b==IntPtr.Zero)return false;uint x,y;Native.GetWindowThreadProcessId(a,out x);Native.GetWindowThreadProcessId(b,out y);return x!=0&&x==y;}
+  static bool IsCurrentProcess(IntPtr window){if(window==IntPtr.Zero)return false;uint id;Native.GetWindowThreadProcessId(window,out id);return id==(uint)Process.GetCurrentProcess().Id;}
  void LaunchGame(){Flow.Begin("launch","从战网启动并等待游戏页面。");
   Check();if(GameExists())throw new Exception("游戏仍在运行，已停止，避免重复启动。");
   var p=LaunchButton();
@@ -192,14 +227,17 @@ sealed class Runner {
   Check();Native.SetCursorPos(p.X,p.Y);Native.Send(Native.M(2),Native.M(4));log("已点击战网进入游戏，等待自动进入规则集页面。");
   IntPtr launcher=target;target=IntPtr.Zero;var end=DateTime.UtcNow.AddSeconds(120);
   while(DateTime.UtcNow<end){
-   Check();IntPtr game=UniqueWindow(GamePath),front=Native.GetForegroundWindow();
-   if(game!=IntPtr.Zero&&SameProcess(front,game)){target=game;Bind();break;}
-   if(front!=IntPtr.Zero&&!SameProcess(front,launcher)&&!SameProcess(front,game)){var title=new StringBuilder(512);Native.GetWindowText(front,title,512);throw new Exception("启动期间切换到了其他窗口，已停止："+title);}
+    Check();IntPtr game=UniqueWindow(GamePath,true),front=Native.GetForegroundWindow();
+    if(game!=IntPtr.Zero){Native.FocusWindow(game);Delay(500);Bind(game);log("已绑定游戏窗口，等待页面稳定。");break;}
+    if(front!=IntPtr.Zero&&!SameProcess(front,launcher)&&!SameProcess(front,game)&&!IsCurrentProcess(front)){
+     var title=new StringBuilder(512);Native.GetWindowText(front,title,512);
+     if(title.ToString()!="魔兽世界")throw new Exception("启动期间切换到了其他窗口，已停止："+title);
+    }
    Delay(300);
   }
   if(target==IntPtr.Zero)throw new Exception("游戏启动超时，已停止。");
   end=DateTime.UtcNow.AddSeconds(120);
-  while(DateTime.UtcNow<end){Native.Rect bounds;if(!Native.GetClientRect(target,out bounds)||bounds.R<1280||Math.Abs(bounds.R/(double)bounds.B-16.0/9)>0.03){Delay(700);continue;}string st=Observe();if(st=="rules"||st=="list"||st=="race")return;Delay(700);}
+  while(DateTime.UtcNow<end){Native.Rect bounds;if(!Native.GetClientRect(target,out bounds)||bounds.R<1280||bounds.B<720){Delay(700);continue;}string st=Observe();if(st=="rules"||st=="list"||st=="race")return;Delay(700);}
   throw new Exception("未进入可识别的建角页面，已停止。请手动处理登录、排队或错误提示。");
  }
  void RestartAfterDelay(){
@@ -208,7 +246,7 @@ sealed class Runner {
  void Cooldown(string reason){Flow.Begin("wait",reason+"，等待 "+interval+" 秒后重试。");Interlocked.Exchange(ref nextTicks,DateTime.UtcNow.AddSeconds(interval).Ticks);target=IntPtr.Zero;log(reason+"，等待 "+interval+" 秒。等待期间可切换窗口，F9 或 Esc 可停止。");Delay((interval-5)*1000);log("5 秒后自动切回，开始下一轮。");Delay(5000);Interlocked.Exchange(ref nextTicks,0);}
  void ReselectAfterDelay(){Cooldown("本轮受阵营限制");target=UniqueWindow(GamePath);if(target==IntPtr.Zero)throw new Exception("等待期间游戏已关闭，已停止。");Native.FocusWindow(target);Thread.Sleep(500);Check();}
  Bitmap Capture(){
-  Check();Native.Rect r;if(!Native.GetClientRect(target,out r))throw new Exception("无法读取游戏客户区尺寸。");config.ValidateDisplay(r.R,r.B);if(r.R!=observedWidth||r.B!=observedHeight){observedWidth=r.R;observedHeight=r.B;log("显示检测："+r.R+"×"+r.B+" 物理像素；标准 16:9；模式："+config.DisplayMode);}
+  Check();Native.Rect r;if(!Native.GetClientRect(target,out r))throw new Exception("无法读取游戏客户区尺寸。");config.ValidateDisplay(r.R,r.B);if(r.R!=observedWidth||r.B!=observedHeight){observedWidth=r.R;observedHeight=r.B;log("显示检测："+r.R+"×"+r.B+" 物理像素；按当前客户区宽高换算；模式："+config.DisplayMode);}
   origin=new Point(0,0);Native.ClientToScreen(target,ref origin);
   scaleX=r.R/2560.0;scaleY=r.B/1440.0;
   using(var raw=new Bitmap(r.R,r.B,PixelFormat.Format32bppArgb)){
@@ -217,21 +255,95 @@ sealed class Runner {
   }
  }
  static string PageName(string value){switch(value){case "rules":return "规则集选择";case "list":return "角色列表";case "race":return "种族与职业";case "custom":return "外观与姓名";case "loading":return "加载中";case "blocked":return "阵营限制";default:return "暂未识别（等待页面稳定）";}}
- string Observe(){using(var b=Capture()){latest=new Mask(b);state=v.State(latest);if(state!=observedState){observedState=state;string file=session+"-"+(++step).ToString("D3")+"-"+state+".png";b.Save(Path.Combine(AppPaths.Screenshots,file));log("页面检查："+PageName(state)+"；截图："+file);}return state;}}
+ Point? pvpBadge;
+ bool configuredPortraitSelected;
+ string Observe(){using(var b=Capture()){latest=new Mask(b);state=v.State(latest);pvpBadge=null;
+   if(state=="unknown" && RaceScreen.IsRacePage(b))state="race";
+   configuredPortraitSelected=state=="race" && RaceScreen.PortraitSelected(b,config.RacePoint);
+   if(state=="unknown"||state=="rules"){pvpBadge=PvpBadge.Find(b,latest.Gold);if(pvpBadge.HasValue)state="rules";}
+   if(state!=observedState){observedState=state;string file=session+"-"+(++step).ToString("D3")+"-"+state+".png";b.Save(Path.Combine(AppPaths.Screenshots,file));log("页面检查："+PageName(state)+"；截图："+file);}return state;}}
  public void SaveDiagnostic(string name){try{using(var b=Capture())b.Save(Path.Combine(AppPaths.Screenshots,name+".png"));}catch{}}
- void Wait(string expected,int seconds=60){var end=DateTime.UtcNow.AddSeconds(seconds);int stable=0;while(DateTime.UtcNow<end){if(Observe()==expected){if(++stable>=3)return;}else stable=0;Delay(600);}throw new Exception("等待页面超时："+expected+"；已停止，请检查游戏。");}
+ void Wait(string expected,int seconds=60){
+  var end=DateTime.UtcNow.AddSeconds(seconds);
+  int stable=0;
+  while(DateTime.UtcNow<end){
+   if(Observe()==expected){if(++stable>=3)return;}else stable=0;
+   Delay(600);
+  }
+  if(expected=="race")SaveDiagnostic(session+"-等待建角页超时");
+  throw new Exception("等待页面超时："+expected+"；已停止，请检查游戏。");
+ }
  void Require(string expected){if(Observe()!=expected)throw new Exception("页面不符合预期，已停止（预期 "+expected+"）。");}
  void Has(string n){if(!v.Has(latest,n))throw new Exception("未核对到 "+n+"，已停止。");}
  bool Identity(string n){if(profile!=null)return profile.Has(latest,n);string key=n=="faction"?"horde":n=="race"?"tauren":n=="gender"?"male":n=="class"?"druid":n;return v.Has(latest,key);}
  void VerifyIdentity(string n){if(!Identity(n))throw new Exception("未核对到配置中的 "+n+"，已停止；请重新预览校准。");}
  void Pick(int x,int y,string label,bool learning){for(int i=0;i<2;i++){Wait("race");Click(x,y);Wait("race");if(learning||Identity(label))return;}throw new Exception("选择后未核对到配置的 "+label+"，已停止。");}
  void SelectOption(int x,int y,string label){for(int i=0;i<2;i++){Wait("race");Click(x,y);Wait("race");if(v.Has(latest,label))return;}throw new Exception("选择后未核对到 "+label+"，已停止。");}
- void Click(int x,int y){
-  Check();Point p=new Point(origin.X+(int)(x*scaleX),origin.Y+(int)(y*scaleY));
-  if(Native.GetAncestor(Native.WindowFromPoint(p),2)!=target)throw new Exception("点击位置被其他窗口遮挡，已停止。");
-  Native.SetCursorPos(p.X,p.Y);Delay(100);Check();Native.Send(Native.M(2),Native.M(4));ParkMouse();Delay(600);Observe();
- }
+  void Click(int x,int y,bool holdForGameFrame=false){
+   Check();Point p=new Point(origin.X+(int)(x*scaleX),origin.Y+(int)(y*scaleY));
+   if(Native.GetAncestor(Native.WindowFromPoint(p),2)!=target)throw new Exception("点击位置被其他窗口遮挡，已停止。");
+   Native.SetCursorPos(p.X,p.Y);Delay(100);Check();
+   if(holdForGameFrame){
+    Native.Send(Native.M(2));
+    try{Delay(100);}finally{Native.Send(Native.M(4));}
+    Delay(150);
+   }else Native.Send(Native.M(2),Native.M(4));
+   ParkMouse();Delay(600);Observe();
+  }
+  void ClickUv(double u,double v){
+   if(u<0||u>1||v<0||v>1)throw new Exception("规则集点击位置超出游戏客户区，已停止。");
+   Click((int)(2560*u),(int)(1440*v));
+  }
+  void ConfirmRule(){
+   var end=DateTime.UtcNow.AddSeconds(6);
+   while(DateTime.UtcNow<end){
+    using(var frame=Capture()){
+     var mask=new Mask(frame);
+     if(v.State(mask)!="rules"&&!PvpBadge.Find(frame,mask.Gold).HasValue)throw new Exception("规则页已变化，已停止。");
+     bool selected=config.RuleSet!="PvP"||v.Has(mask,"pvpSelected",90);
+     var center=selected?v.EnabledSelect(frame,mask):null;
+     if(center.HasValue){Click(center.Value.X,center.Value.Y);log("已点击规则页右下角的“选择”。");return;}
+    }
+    Delay(350);
+   }
+   SaveDiagnostic("调试-规则确认");throw new Exception("未核对到所选规则或已启用的“选择”按钮，已停止。");
+  }
+  void SelectRuleSet(){
+   Require("rules");
+   if(config.RuleSet=="PvP"){
+    if(!pvpBadge.HasValue)throw new Exception("未在第二张卡找到 PvP 短标题和红蓝徽章，已停止。");
+    Point badge=pvpBadge.Value;
+     if(v.Has(latest,"pvpSelected",90)){log("PvP 卡已高亮。");return;}
+     log("已定位 PvP 红蓝徽章，点击标准坐标 "+badge.X+","+badge.Y+"。");
+    Click(badge.X,badge.Y);Require("rules");
+    if(v.Has(latest,"pvpSelected",90)){log("已核对到 PvP 选中状态。");return;}
+    SaveDiagnostic("调试-PvP未选中");
+    throw new Exception("点击 PvP 后未核对到选中状态，已停止。");
+   }
+   double[] ruleU={0.326,0.452,0.581,0.707};
+   if(config.RuleIndex<0||config.RuleIndex>=ruleU.Length)throw new Exception("未找到所选规则集的位置，已停止。");
+   ClickUv(ruleU[config.RuleIndex],0.52);Require("rules");
+  }
  void ParkMouse(){Check();Native.SetCursorPos(origin.X+(int)(600*scaleX),origin.Y+(int)(1100*scaleY));}
+ void OpenAppearance(){
+  for(int attempt=1;attempt<=2;attempt++){
+   Require("race");
+   Point? button;
+   using(var frame=Capture())button=v.AppearanceButton(frame,new Mask(frame));
+   if(!button.HasValue)break;
+   Click(button.Value.X,button.Value.Y,true);
+   log("已向“自定外观”发送第 "+attempt+" 次点击，等待页面切换。");
+   var deadline=DateTime.UtcNow.AddSeconds(6);
+   while(DateTime.UtcNow<deadline){
+    if(state=="custom"){Wait("custom");return;}
+    Delay(350);Observe();
+   }
+   if(state=="custom"){Wait("custom");return;}
+   if(state!="race"){Wait("custom",12);return;}
+  }
+  SaveDiagnostic(session+"-自定外观");
+  throw new Exception("未确认进入外观页，请检查右下角“自定外观”按钮及当前页面。");
+ }
  void Button(string name,string expected){var end=DateTime.UtcNow.AddSeconds(30);while(DateTime.UtcNow<end){Require(expected);var p=v.Candidates(name).FirstOrDefault(t=>t.Find(latest).HasValue);if(p!=null){var at=p.Find(latest).Value;Click(at.X+p.W/2,at.Y+p.H/2);return;}Delay(700);}throw new Exception("按钮被遮挡或未识别："+name);}
  void Fill(int x,string text){
   Require("custom");Click(x,65);Require("custom");Check();
@@ -248,20 +360,28 @@ sealed class Runner {
   if(st=="race"){Button("back","race");Wait("list");st="list";}
   if(st=="list"){Button("ruleButton","list");Wait("rules");st="rules";}
   if(st!="rules")throw new Exception("无法识别起始页面。请停在规则集、角色创建页或阵营限制提示上。");
- }
- CalibrationBundle PrepareCharacter(bool learning){
-  Flow.Begin("rules","选择并确认 "+config.RuleSet+" 规则集。");log("选择规则集："+config.RuleSet+"。");int ruleX=new[]{773,1110,1450,1788}[config.RuleIndex];
-  Require("rules");Click(ruleX,610);Require("rules");if(!v.P["pvpSelected"].Find(latest,0.78,ruleX-1110).HasValue)throw new Exception("未核对到所选规则集的高亮边框，已停止。");Button("select","rules");
+  }
+  CalibrationBundle PrepareCharacter(bool learning){
+   Flow.Begin("rules","选择并确认 "+config.RuleSet+" 规则集。");log("选择规则集："+config.RuleSet+"。");
+   SelectRuleSet();
+   ConfirmRule();
   // With no characters, this client opens race selection immediately.
   var end=DateTime.UtcNow.AddSeconds(30);
   while(DateTime.UtcNow<end){string st=Observe();if(st=="race")break;if(st=="list"){Button("create","list");break;}Delay(600);}
   Wait("race");Flow.Begin("role",config.Faction+" / "+config.Race+" / "+config.Gender+" / "+config.ClassName);log("设置角色："+config.Faction+" / "+config.Race+" / "+config.Gender+" / "+config.ClassName);
-  var racePoint=config.RacePoint;Pick(racePoint.X,racePoint.Y,"race",learning);
+   var racePoint=config.RacePoint;
+   if(!configuredPortraitSelected){
+    log("点击"+config.Faction+"种族头像："+config.Race+"。");Click(racePoint.X,racePoint.Y);Wait("race");
+   }
+   if(!configuredPortraitSelected){SaveDiagnostic(session+"-种族头像未选中");throw new Exception("未核对到"+config.Race+"头像的选中边框，已停止。");}
+   log("已核对"+config.Race+"头像金框。");
   Pick(config.GenderX,55,"gender",learning);var classPoint=config.ClassPoint;Pick(classPoint.X,classPoint.Y,"class",learning);
   Require("race");if(!learning){VerifyIdentity("race");VerifyIdentity("class");VerifyIdentity("gender");VerifyIdentity("faction");}
   var bundle=new CalibrationBundle{Config=config.Copy(),RaceImage=Capture()};
   try{
-   Flow.Begin("names","打开外观页，填写并核对两个名字。");Button("appearance","race");Wait("custom");log("填写姓名："+config.FirstName+" / "+config.LastName);Fill(1075,config.FirstName);Fill(1485,config.LastName);
+    Flow.Begin("names","打开外观页，填写并核对两个名字。");
+     OpenAppearance();log("已进入外观页，填写姓名："+config.FirstName+" / "+config.LastName);
+    Fill(1075,config.FirstName);Fill(1485,config.LastName);
    Require("custom");if(!learning){VerifyIdentity("first");VerifyIdentity("last");}bundle.NameImage=Capture();return bundle;
   }catch{bundle.Dispose();throw;}
  }
@@ -270,11 +390,25 @@ sealed class Runner {
   Flow.Begin("submit","核对完成按钮，留档并提交建号请求。");
   // Only the enabled red completion button is allowed.
   if(latest==null)throw new Exception("缺少页面。");
-  using(var b=Capture()){Color c=b.GetPixel(2270,1370);if(c.R<100||c.R<c.G*1.8)throw new Exception("完成按钮未启用，已停止。");}
-  AttemptRecord record;using(var b=Capture())record=ResultsStore.Add(config,attempt,"待确认","准备发送建号请求。若程序中断，请先核对游戏；这条记录不代表请求已送达或创建成功。",b);
-  SaveDiagnostic("调试-提交前");log("角色与姓名核对通过，提交创建。");Button("finish","custom");return record;
+  Point center;
+  AttemptRecord record;
+  using(var frame=Capture()){
+   var mask=new Mask(frame);
+   if(v.State(mask)!="custom")throw new Exception("已离开姓名页，停止提交。");
+   var button=v.EnabledFooterButton(frame,mask,"finish");
+   if(!button.HasValue)throw new Exception("未识别到已启用的“完成”按钮，已停止。");
+   center=button.Value;
+   frame.Save(Path.Combine(AppPaths.Screenshots,"调试-提交前.png"));
+   record=ResultsStore.Add(config,attempt,"待确认","准备发送建号请求。若程序中断，请先核对游戏；这条记录不代表请求已送达或创建成功。",frame);
+  }
+  Click(center.X,center.Y,true);
+  log("已点击“完成”，等待游戏返回结果。");return record;
  }
- public CalibrationBundle Calibrate(){Flow.Begin("prepare","检查配置并准备不提交预览。");config.Validate();FocusInitial();log("预览校准：不会点击完成或提交建号。");Delay(3000);if(GameExists())Bind();else LaunchGame();BackToRules();return PrepareCharacter(true);}
+  public CalibrationBundle Calibrate(){
+   try{Flow.Begin("prepare","检查配置并准备不提交预览。");config.Validate();FocusInitial();log("预览校准：不会点击完成或提交建号。");Delay(3000);if(GameExists())Bind();else LaunchGame();BackToRules();return PrepareCharacter(true);}
+   catch(OperationCanceledException){throw;}
+   catch(Exception ex){log("预览诊断："+ex);throw;}
+  }
  void FocusInitial(){var h=UniqueWindow(GamePath);if(h!=IntPtr.Zero){Native.FocusWindow(h);Thread.Sleep(500);target=h;Check();}else ShowLauncher();}
  void Record(AttemptRecord record,string status,string detail){using(var b=Capture())ResultsStore.Update(record,status,detail,b);}
  public void Run(bool activate=false){
@@ -289,7 +423,13 @@ sealed class Runner {
   for(int i=1;i<=max;i++){AttemptNumber=i;
    log("第 "+i+" 轮：返回并重新选择 "+config.RuleSet+"。");BackToRules();var record=Create(i);Flow.Begin("result","等待并识别服务器返回结果。");
    var end=DateTime.UtcNow.AddSeconds(35);bool blocked=false;
-   while(DateTime.UtcNow<end){if(Observe()=="blocked"){blocked=true;break;}Delay(700);}
+   while(DateTime.UtcNow<end){
+    using(var frame=Capture()){
+     var mask=new Mask(frame);
+     blocked=v.Has(mask,"blocked",72)||v.Has(mask,"blockedOld",72)||(restart&&ExitMenu.IsBlocked(frame));
+    }
+    Check();if(blocked)break;Delay(700);
+   }
    if(!blocked){Flow.Finish("待确认","没有识别到已知阵营限制；请人工核对游戏结果。");
     Record(record,"待确认","提交后未识别到阵营限制，请核对结果截图与游戏角色列表；自动重试已停止。");
     using(var b=Capture())b.Save(Path.Combine(AppPaths.Screenshots,"最后结果.png"));
@@ -324,7 +464,6 @@ static class Program {
    }
    if(args.Length==1&&args[0]=="--capture-launcher"){Task.Run(()=>new Runner(v,t=>{},CancellationToken.None,120,1,true).SnapshotLauncher()).GetAwaiter().GetResult();return 0;}
    if(args.Length==1&&(args[0]=="--launcher-check"||args[0]=="--launch-only")){using(var cancel=new CancellationTokenSource(TimeSpan.FromMinutes(5))){var runner=new Runner(v,t=>File.AppendAllText(Path.Combine(AppPaths.Logs,"启动验证.txt"),DateTime.Now.ToString("s")+" "+t+Environment.NewLine),cancel.Token,120,1,true);Task.Run(()=>{if(args[0]=="--launch-only")runner.LaunchOnly();else runner.CheckLauncherOnly();}).GetAwaiter().GetResult();}return 0;}
-   if(args.Length==1&&args[0]=="--launcher-select-test"){Task.Run(()=>new Runner(v,t=>{},CancellationToken.None,120,1,true).SelectInfiniteLauncher()).GetAwaiter().GetResult();return 0;}
    if(args.Length==1&&args[0]=="--capture-game"){Task.Run(()=>new Runner(v,t=>{},CancellationToken.None,120,1,true).SnapshotGame()).GetAwaiter().GetResult();return 0;}
    // Bounded live test uses the same runner as the GUI; no external UI driver.
    if(args.Length==2&&(args[0]=="--run"||args[0]=="--run-reselect")){

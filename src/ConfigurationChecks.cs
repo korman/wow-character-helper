@@ -11,7 +11,7 @@ static class ConfigurationChecks {
   var log=new List<string>();
   Action<bool,string> check=(yes,name)=>{if(!yes)throw new Exception("FAIL: "+name);log.Add("PASS: "+name);};
   try{
-   var c=new CreationConfig();c.Validate();c.ValidateDisplay(3840,2160);var manual=c.Copy();manual.DisplayMode=CreationConfig.DisplayModes[2];bool mismatch=false;try{manual.ValidateDisplay(3840,2160);}catch{mismatch=true;}check(mismatch,"manual resolution mismatch stops");bool ultrawide=false;try{c.ValidateDisplay(3440,1440);}catch{ultrawide=true;}check(ultrawide,"unsupported ultrawide stops");check(c.Builtin&&CalibrationStore.Ready(c),"default verified profile");
+    var c=new CreationConfig();c.Validate();c.ValidateDisplay(3840,2160);var manual=c.Copy();manual.DisplayMode=CreationConfig.DisplayModes[2];bool mismatch=false;try{manual.ValidateDisplay(3840,2160);}catch{mismatch=true;}check(mismatch,"manual resolution mismatch stops");c.ValidateDisplay(3440,1440);check(c.Builtin&&CalibrationStore.Ready(c),"default verified profile");
    var changed=c.Copy();changed.FirstName="测试配置";check(!changed.Builtin&&!CalibrationStore.Ready(changed),"changed name requires calibration");
    changed.Save();var read=CreationConfig.Load();check(read.FirstName==changed.FirstName&&read.Key==changed.Key,"Unicode configuration round trip");
    changed.LastName="测试次名";changed.IntervalSeconds=300;changed.Scheduled=true;changed.StartAt=DateTime.Now.AddDays(1);changed.Save();read=CreationConfig.Load();check(read.LastName==changed.LastName&&read.IntervalSeconds==300&&read.Scheduled,"configuration replacement and schedule");

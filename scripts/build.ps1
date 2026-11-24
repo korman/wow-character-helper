@@ -9,7 +9,10 @@ if (-not (Test-Path -LiteralPath $compiler)) { throw '.NET Framework compiler no
 $source = @(Get-ChildItem (Join-Path $repoRoot 'src') -Filter '*.cs' | ForEach-Object FullName)
 $binary = Join-Path $OutputDirectory 'RetryPvp.exe'
 $manifest = Join-Path $repoRoot 'src\app.manifest'
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 "/out:$binary" "/win32manifest:$manifest" /r:System.Drawing.dll /r:System.Windows.Forms.dll $source
+$sdk = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\UnionMetadata\10.*\Windows.winmd" | Sort-Object FullName -Descending | Select-Object -First 1
+if (!$sdk) { throw 'Windows 10 SDK metadata is required for game menu OCR.' }
+$facades = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8\Facades"
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 "/out:$binary" "/win32manifest:$manifest" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Runtime.WindowsRuntime.dll "/r:$facades\System.Runtime.dll" "/r:$($sdk.FullName)" $source
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 Copy-Item -LiteralPath (Join-Path $repoRoot 'src\app.config') -Destination ($binary + '.config')
 foreach ($directory in @('templates','docs')) {
